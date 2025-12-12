@@ -3,7 +3,7 @@ using Plots, GraphRecipes, Graphs, Colors, Statistics, StatsBase
 function get_zone_coordinates()
     return Dict(
         1 => (-122.4, 37.8),   # NorCal (San Francisco)
-        2 => (-118.2, 34.1),   # SoCal (Los Angeles)
+        2 => (-120.2, 34.1),   # SoCal (Los Angeles)
         3 => (-117.2, 32.7),   # SD_IID (San Diego)
         12 => (-104.9, 39.7),  # CO (Denver)
         8 => (-112.1, 33.4),   # AZ (Phoenix)
@@ -26,6 +26,7 @@ function plot_power_network(
     gen_df,                # Generator data with zone info
     zone_dict;             # Zone ID -> Zone name mapping
     hour=nothing,          # Specific hour to plot (or nothing for average)
+    hours=nothing,         # All hours in dataset (for animation)
     title_str="Power Network Flows",
     node_size_by_gen=true, # Size nodes by generation capacity
     save_path="network_flows.png",
@@ -39,6 +40,9 @@ function plot_power_network(
     # Filter flows for specific hour or average
     if hour !== nothing
         flows_hour = flows_df[flows_df.hour .== hour, :]
+        if hours !== nothing
+            hour = hour - minimum(hours)  # Normalize hour for title
+        end
         title_str = "$title_str - Hour $hour"
     else
         # Average over all hours
@@ -114,35 +118,77 @@ function plot_power_network(
         aspect_ratio=:equal
     )
     
-    # Draw edges with width proportional to flow
-    for i in zones
-        for j in zones
-            if flow_matrix[i, j] > 0
-                flow_val = flow_matrix[i, j]
-                max_flow = maximum(flow_matrix[flow_matrix .> 0])
-                
-                # Edge width and color based on flow
-                edge_width = (flow_val / max_flow) * 10 + 0.5
-                edge_alpha = min(1.0, (flow_val / max_flow) * 0.8 + 0.2)
-                
-                # Draw arrow from i to j
-                plot!(p, 
-                    [node_x[i], node_x[j]], 
-                    [node_y[i], node_y[j]],
-                    arrow=Plots.Arrow(:closed, :head, arrow_scale * 100, arrow_scale * 100),
-                    linewidth=edge_width,
-                    color=RGBA(0.2, 0.4, 0.8, edge_alpha),
-                    label=""
-                )
-                
-                # Add flow label at midpoint
-                mid_x = (node_x[i] + node_x[j]) / 2
-                mid_y = (node_y[i] + node_y[j]) / 2
-                annotate!(p, mid_x, mid_y, 
-                         text("$(round(flow_val, digits=0))", 16, :blue))
+    # Draw edges with arrows for each connection
+    for row in eachrow(flows_hour)
+        line_idx = row.line
+        flow_val = abs(row.flow)
+        
+        if flow_val > 0
+            # Find zones connected by this line
+            for i in zones
+                for j in zones
+                    if i < j
+                        coef_i = network[line_idx, string(i)]
+                        coef_j = network[line_idx, string(j)]
+                        
+                        if coef_i != 0 && coef_j != 0
+                            # Determine direction based on coefficients
+                            if coef_i > 0
+                                from_zone, to_zone = j, i
+                            else
+                                from_zone, to_zone = i, j
+                            end
+                            
+                            # Edge width and color based on flow
+                            max_flow = maximum(flows_hour.flow)
+                            edge_width = (flow_val / max_flow) * 8 + 1.5
+                            edge_alpha = min(1.0, (flow_val / max_flow) * 0.8 + 0.3)
+                            
+                            # Get coordinates
+                            x1, y1 = node_x[findfirst(==(from_zone), zones)], node_y[findfirst(==(from_zone), zones)]
+                            x2, y2 = node_x[findfirst(==(to_zone), zones)], node_y[findfirst(==(to_zone), zones)]
+                            
+                            # Calculate arrow direction and shorten line
+                            dx = x2 - x1
+                            dy = y2 - y1
+                            dist = sqrt(dx^2 + dy^2)
+                            node_radius = 0.5
+                            
+                            if dist > 2 * node_radius
+                                scale = (dist - node_radius) / dist
+                                x2_adj = x1 + dx * scale
+                                y2_adj = y1 + dy * scale
+                                
+                                scale_start = node_radius / dist
+                                x1_adj = x1 + dx * scale_start
+                                y1_adj = y1 + dy * scale_start
+                            else
+                                x1_adj, y1_adj = x1, y1
+                                x2_adj, y2_adj = x2, y2
+                            end
+                            
+                            # Draw arrow with explicit arrow parameters
+                            plot!(p, 
+                                [x1_adj, x2_adj], 
+                                [y1_adj, y2_adj],
+                                arrow=(:closed, :head, 2.0, 2.0),  # Larger, more visible arrows
+                                linewidth=edge_width,
+                                color=RGBA(0.2, 0.4, 0.8, edge_alpha),
+                                label=""
+                            )
+                            
+                            # Add flow label at midpoint
+                            mid_x = (x1 + x2) / 2
+                            mid_y = (y1 + y2) / 2
+                            annotate!(p, mid_x, mid_y, 
+                                     text("$(round(flow_val, digits=0))", 8, :blue))
+                        end 
+                    end
+                end
             end
         end
     end
+    
     
     # Draw nodes
     scatter!(p,
@@ -153,7 +199,7 @@ function plot_power_network(
         markerstrokewidth=2,
         markerstrokecolor=:black,
         label="",
-        series_annotations=text.([zone_dict[z] for z in zones], 14, :black, :bottom)
+        series_annotations=text.([zone_dict[z] for z in zones], 9, :black, :center)
     )
         
     # Add legend
@@ -194,6 +240,7 @@ function animate_power_network(
         hours = sort(unique(flows_df.hour))
     end
 
+    # hours = hours .- minimum(hours)  # Normalize hours for animation
     anim = @animate for hour in hours
         plot_power_network(
             flows_df,
@@ -201,6 +248,7 @@ function animate_power_network(
             gen_df,
             zone_dict;
             hour=hour,
+            hours=hours,
             title_str="Power Network Flows",
             save_path=nothing
         )
