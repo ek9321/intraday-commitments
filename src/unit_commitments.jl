@@ -264,7 +264,7 @@ function unit_commitment_transport(gen_df, loads, gen_var, network, mip_gap)
         SHUT[G_thermal, T], Bin   # shutdown decision
         RESUP[G_thermal, T]       # up reserve capacity
         RESDN[G_thermal, T]       # down reserve capacity
-        FLOW[l in L, t in T] >= 0 # power flows
+        FLOW[l in L, t in T]      # power flows
 
         # battery vars
         0 <= SOC[b in B, T] <= storage_df[storage_df.r_id .== b, :existing_cap_mw][1]  # state of charge
