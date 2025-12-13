@@ -1,6 +1,10 @@
 # intraday-commitments
 
 ### Hello! This is Eddie's term project for MAE573. The structure of the repo is as follows: 
+
+#### /WECC: 
+contains all data used for the project. This was the wecc_2020_unit_commitment/WECC_large
+
 #### /experiment_notebooks: 
 
 #### /model_notebooks: 
@@ -8,8 +12,6 @@
 #### /src: 
 All source code for the project. 
 
-#### /WECC: 
-contains all data used for the project. This was the wecc_2020_unit_commitment/WECC_large
 
 Plots.jl could be streamlined greatly because I made sep stuff for RUC/non-ruc
 
@@ -19,3 +21,7 @@ Used code from notebooks 2, 5, HW 3, 5, Lab 3
 
 storage per zone
 better variability models
+
+different seasons
+
+really needed to do a two-stage
