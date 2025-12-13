@@ -223,6 +223,72 @@ function plot_actual_generation(solution, T_period, gen_df, zone_dict, title)
     return sol_gen
 end
 
+function plot_actual_ruc_generation(ruc_actual_solution, initial_time, recommit_time, gen_df, zone_dict, title)
+    """
+    Plot total generation for RUC evaluation on actual conditions.
+    Shows UC commitments before recommit_time, RUC commitments after.
+    Includes load shedding to show system stress.
+    """
+    
+    sol_gen = innerjoin(ruc_actual_solution.gen, 
+                    gen_df[!, [:r_id, :technology]], 
+                    on = :r_id)
+    sol_gen = combine(groupby(sol_gen, [:technology, :hour]), 
+                :gen => sum)
+
+    # Curtailment
+    curtail = combine(groupby(ruc_actual_solution.curtail, [:hour]),
+                :curt => sum)
+    curtail[!, :technology] .= "_curtailment"
+    rename!(curtail, :curt_sum => :gen_sum)
+    append!(sol_gen, curtail[:,[:technology, :hour, :gen_sum]])
+
+    # Load shedding
+    loadshed = combine(groupby(ruc_actual_solution.loadshed, [:hour]),
+                :gen => sum)
+    loadshed[!, :technology] .= "_load_shedding"
+    rename!(loadshed, :gen_sum => :gen_sum)
+    append!(sol_gen, loadshed[:,[:technology, :hour, :gen_sum]])
+
+    # Add storage discharge and charge
+    for (storagetype, storagelabel, df) in [
+        ("discharge", "_storage_discharge", ruc_actual_solution.discharge_df),
+        ("charge", "_storage_charge", ruc_actual_solution.charge_df)
+        ]
+        storage_plot = combine(groupby(df, :hour), :gen => sum)
+        storage_plot[!, :technology] .= storagelabel
+        rename!(storage_plot, :gen_sum => :gen_sum)
+        append!(sol_gen, storage_plot[:, [:technology, :hour, :gen_sum]])
+    end
+
+    # Rescale hours
+    sol_gen.hour = sol_gen.hour .- initial_time
+    
+    # Create plot with vertical line at recommit time
+    sol_gen |>
+    @vlplot(
+        layer = [
+            {
+                mark = :area,
+                encoding = {
+                    x = {:hour, type = "quantitative", title = "Hour"},
+                    y = {:gen_sum, type = "quantitative", stack = :zero, title = "Generation (MW)"},
+                    color = {"technology:n", scale = {scheme = "category10"}}
+                }
+            },
+            {
+                mark = {type = :rule, strokeDash = [5, 5], size = 2, color = "red"},
+                encoding = {
+                    x = {datum = recommit_time}
+                }
+            }
+        ],
+        title = "$(title) (RUC at hour $(recommit_time))"
+    ) |> display
+
+    return sol_gen
+end;
+
 function plot_actual_generation_by_zone(solution, T_period, gen_df, zone_dict, title = "Generation by Technology Across Zones (Actual Conditions)")
     # Join generator zone info
     sol_gen_zone = innerjoin(solution.gen, gen_df[:, [:r_id, :technology, :zone]], on = :r_id)

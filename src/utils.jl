@@ -330,3 +330,272 @@ function evaluate_commitment_on_actuals(
         objective = objective_value(UC)
     )
 end
+
+function evaluate_ruc_commitment_on_actuals(
+    uc_solution,
+    ruc_solution,
+    recommit_time,
+    gen_df,
+    loads_actual,
+    gen_var_actual,
+    network,
+    mip_gap
+)
+    """
+    Fix commitment decisions from initial UC + RUC adjustments,
+    re-dispatch generation/storage/reserves against actual conditions.
+    
+    Before recommit_time: use uc_solution commitments
+    After recommit_time: use ruc_solution commitments
+    """
+    
+    UC = Model(HiGHS.Optimizer)
+    set_optimizer_attribute(UC, "mip_rel_gap", mip_gap)
+    
+    # Same setup as your UC model
+    storage_df = gen_df[gen_df.stor .== 1, :]
+    gen_df_clean = gen_df[gen_df.stor .== 0, :]
+    
+    G_thermal = gen_df_clean[gen_df_clean[!,:up_time] .> 0,:r_id]
+    G_nonthermal = gen_df_clean[gen_df_clean[!,:up_time] .== 0,:r_id]       
+    G_var = gen_df_clean[gen_df_clean[!,:vre] .== 1, :r_id]
+    G_nonvar = gen_df_clean[gen_df_clean[!,:vre] .== 0,:r_id]
+    G_nt_nonvar = intersect(G_nonvar, G_nonthermal)
+    B = storage_df.r_id
+    G = gen_df_clean.r_id
+    L = network.network_lines
+    T = unique(loads_actual.hour)
+    T_red = T[1:end-1]
+    Z = unique(gen_df_clean.zone)
+    
+    # Define all variables
+    @variables(UC, begin
+        GEN[i in G, t in T] >= 0
+        GENAUX[i in G_thermal, t in T] >= 0
+        CHARGE[b in B, t in T] >= 0
+        DISCHARGE[b in B, t in T] >= 0
+        SOC[b in B, t in T] >= 0
+        FLOW[l in L, t in T]
+        RESUP[i in G_thermal, t in T] >= 0
+        RESDN[i in G_thermal, t in T] >= 0
+        LOADSHED[z in Z, t in T] >= 0
+    end)
+    
+    # **KEY: Fix commitment from day-ahead UC + RUC**
+    @variable(UC, COMMIT[i in G_thermal, t in T], Bin)
+    
+    # Extract commitment values from both solutions
+    uc_commit_df = uc_solution.commit
+    ruc_commit_df = ruc_solution.commit
+    
+    for i in G_thermal
+        for t in T
+            # Determine which solution to use based on recommit_time
+            if t < recommit_time
+                commit_val = uc_commit_df[(uc_commit_df.r_id .== i) .& (uc_commit_df.hour .== t), :gen]
+                fix(COMMIT[i, t], commit_val[1]; force=true)
+            else 
+                commit_val = ruc_commit_df[(ruc_commit_df.r_id .== i) .& (ruc_commit_df.hour .== t), :gen]
+                fix(COMMIT[i, t], commit_val[1]; force=true)
+            end
+        end
+    end
+    
+    # Objective: minimize redispatch cost + load shedding penalty
+    @objective(UC, Min,
+        sum(gen_df_clean[gen_df_clean.r_id .== i, :var_om_cost_per_mwh][1] * GEN[i, t] 
+            for i in G, t in T) +
+        sum(10000 * LOADSHED[z, t] for z in Z, t in T)
+    )
+    
+    # Network balance with load shedding
+    @constraint(UC, NodalBalance[z in Z, t in T],
+        sum(GEN[i, t] for i in G if gen_df_clean[gen_df_clean.r_id .== i, :zone][1] == z) +
+        sum(DISCHARGE[b, t] - CHARGE[b, t] for b in B if storage_df[storage_df.r_id .== b, :zone][1] == z) +
+        LOADSHED[z, t] -
+        loads_actual[loads_actual.zone .== z .&& loads_actual.hour .== t, :demand][1] -
+        sum(network[l, Symbol("$z")] * FLOW[l, t] for l in L) == 0
+    )
+    
+    # Line flow limits
+    @constraint(UC, FlowMax[l in L, t in T],
+        FLOW[l, t] <= network[l, :line_max_flow_mw]
+    )
+    @constraint(UC, FlowMin[l in L, t in T],
+        FLOW[l, t] >= -network[l, :line_max_flow_mw]
+    )
+    
+    # Thermal capacity limits (respecting fixed commitment)
+    @constraint(UC, Cap_thermal_min[i in G_thermal, t in T],
+        GEN[i, t] >= gen_df_clean[gen_df_clean.r_id .== i, :min_power][1] * 
+                     gen_df_clean[gen_df_clean.r_id .== i, :existing_cap_mw][1] * COMMIT[i, t]
+    )
+    @constraint(UC, Cap_thermal_max[i in G_thermal, t in T],
+        GEN[i, t] <= gen_df_clean[gen_df_clean.r_id .== i, :existing_cap_mw][1] * COMMIT[i, t]
+    )
+    
+    # Non-thermal non-variable capacity
+    @constraint(UC, Cap_nt_nonvar[i in G_nt_nonvar, t in T],
+        GEN[i, t] <= gen_df_clean[gen_df_clean.r_id .== i, :existing_cap_mw][1]
+    )
+    
+    # Variable generation using ACTUAL capacity factors
+    @constraint(UC, Cap_var[i in G_var, t in T],
+        GEN[i, t] <= gen_var_actual[(gen_var_actual.r_id .== i) .& (gen_var_actual.hour .== t), :cf][1] * 
+                     gen_df_clean[gen_df_clean.r_id .== i, :existing_cap_mw][1]
+    )
+    
+    # Battery constraints
+    @constraint(UC, ChargeCap[b in B, t in T],
+        CHARGE[b, t] <= storage_df[storage_df.r_id .== b, :existing_cap_mw][1]
+    )
+    @constraint(UC, DischargeCap[b in B, t in T],
+        DISCHARGE[b, t] <= storage_df[storage_df.r_id .== b, :existing_cap_mw][1]
+    )
+    @constraint(UC, SOCCap[b in B, t in T],
+        SOC[b, t] <= storage_df[storage_df.r_id .== b, :existing_cap_mwh][1]
+    )
+    
+    @constraint(UC, cStateOfChargeEnd[b in B],
+        SOC[b, T[end]] == 0.5 * storage_df[storage_df.r_id .== b, :existing_cap_mw][1]
+    )
+    @constraint(UC, cStateOfChargeStart[b in B],
+        SOC[b, T[1]] == 0.5 * storage_df[storage_df.r_id .== b, :existing_cap_mw][1] + # start charge
+                (CHARGE[b, T[1]] * storage_df[storage_df.r_id .== b, :charge_efficiency][1] -
+                DISCHARGE[b, T[1]] / storage_df[storage_df.r_id .== b, :discharge_efficiency][1])
+    )
+    @constraint(UC, cStateOfCharge[b in B, t in T[2:end]],
+        SOC[b, t] == SOC[b, t-1] +
+                    (CHARGE[b, t] * storage_df[storage_df.r_id .== b, :charge_efficiency][1] -
+                    DISCHARGE[b, t] / storage_df[storage_df.r_id .== b, :discharge_efficiency][1])
+    )
+    
+    # Auxiliary generation variable for ramping
+    @constraint(UC, AuxGen[i in G_thermal, t in T],
+        GENAUX[i, t] == GEN[i, t] - 
+        gen_df_clean[gen_df_clean.r_id .== i, :min_power][1] * 
+        gen_df_clean[gen_df_clean.r_id .== i, :existing_cap_mw][1] * COMMIT[i, t]
+    )
+    
+    # Ramping constraints (thermal)
+    @constraint(UC, RampUp_thermal[i in G_thermal, t in T_red],
+        GENAUX[i, t+1] - GENAUX[i, t] <= 
+        gen_df_clean[gen_df_clean.r_id .== i, :ramp_up_percentage][1] * 
+        gen_df_clean[gen_df_clean.r_id .== i, :existing_cap_mw][1]
+    )
+    @constraint(UC, RampDn_thermal[i in G_thermal, t in T_red],
+        GENAUX[i, t] - GENAUX[i, t+1] <= 
+        gen_df_clean[gen_df_clean.r_id .== i, :ramp_dn_percentage][1] * 
+        gen_df_clean[gen_df_clean.r_id .== i, :existing_cap_mw][1]
+    )
+    
+    # Ramping constraints (non-thermal)
+    @constraint(UC, RampUp_nonthermal[i in G_nonthermal, t in T_red],
+        GEN[i, t+1] - GEN[i, t] <= 
+        gen_df_clean[gen_df_clean.r_id .== i, :ramp_up_percentage][1] * 
+        gen_df_clean[gen_df_clean.r_id .== i, :existing_cap_mw][1]
+    )
+    @constraint(UC, RampDn_nonthermal[i in G_nonthermal, t in T_red],
+        GEN[i, t] - GEN[i, t+1] <= 
+        gen_df_clean[gen_df_clean.r_id .== i, :ramp_dn_percentage][1] * 
+        gen_df_clean[gen_df_clean.r_id .== i, :existing_cap_mw][1]
+    )
+    
+    # Reserve constraints
+    @constraint(UC, ResUpCap[i in G_thermal, t in T],
+        RESUP[i, t] <= gen_df_clean[gen_df_clean.r_id .== i, :existing_cap_mw][1] * COMMIT[i, t] - GEN[i, t]
+    )
+    @constraint(UC, ResDnCap[i in G_thermal, t in T],
+        RESDN[i, t] <= GEN[i, t] - 
+        gen_df_clean[gen_df_clean.r_id .== i, :min_power][1] * 
+        gen_df_clean[gen_df_clean.r_id .== i, :existing_cap_mw][1] * COMMIT[i, t]
+    )
+    
+    @constraint(UC, ResUpRamp[i in G_thermal, t in T],
+        RESUP[i, t] <= gen_df_clean[gen_df_clean.r_id .== i, :ramp_up_percentage][1] * 
+        gen_df_clean[gen_df_clean.r_id .== i, :existing_cap_mw][1]
+    )
+    @constraint(UC, ResDnRamp[i in G_thermal, t in T],
+        RESDN[i, t] <= gen_df_clean[gen_df_clean.r_id .== i, :ramp_dn_percentage][1] * 
+        gen_df_clean[gen_df_clean.r_id .== i, :existing_cap_mw][1]
+    )
+    
+    ResReqUp = Dict(t => 300 for t in T)
+    ResReqDn = Dict(t => 0 for t in T)
+    
+    @constraint(UC, ResUpRequirement[t in T],
+        sum(RESUP[i, t] for i in G_thermal) >= ResReqUp[t]
+    )
+    @constraint(UC, ResDnRequirement[t in T],
+        sum(RESDN[i, t] for i in G_thermal) >= ResReqDn[t]
+    )
+    
+    optimize!(UC)
+    
+    # Extract results
+    gen_actual = value_to_df_2dim(value.(GEN))
+    loadshed = value_to_df_2dim(value.(LOADSHED))
+    resup = value_to_df_2dim(value.(RESUP))
+    resdn = value_to_df_2dim(value.(RESDN))
+    
+    # Extract flow values into a DataFrame
+    flow_vals = Dict((l, t) => value(FLOW[l, t]) for l in L, t in T)
+
+    flows = DataFrame(
+        line = repeat(L, inner=length(T)),
+        hour = repeat(collect(T), outer=length(L)),
+        flow = [flow_vals[(l, t)] for l in L for t in T]
+    )
+    
+    # Calculate curtailment
+    curtail = DataFrame(r_id = Int[], hour = Int[], curt = Float64[])
+    for i in G_var
+        for t in T
+            available = gen_var_actual[(gen_var_actual.r_id .== i) .& (gen_var_actual.hour .== t), :cf][1] * 
+                       gen_df_clean[gen_df_clean.r_id .== i, :existing_cap_mw][1]
+            actual_gen = value(GEN[i, t])
+            curt_val = max(0, available - actual_gen)
+            push!(curtail, (i, t, curt_val))
+        end
+    end
+    
+    # Calculate total CO2 emissions
+    total_co2 = sum(
+        gen_df_clean[gen_df_clean.r_id .== i, :heat_rate_mmbtu_per_mwh][1] * 
+        0.05306 *  # tons CO2 per MMBtu
+        value(GEN[i, t]) 
+        for i in G, t in T
+    )
+    
+    # Battery results
+    charge_df = value_to_df_2dim(value.(CHARGE))
+    discharge_df = value_to_df_2dim(value.(DISCHARGE))
+    soc_df = value_to_df_2dim(value.(SOC))
+    
+    # Create combined commitment dataframe showing transition
+    combined_commit = DataFrame(r_id = Int[], hour = Int[], commit = Float64[], source = String[])
+    for i in G_thermal
+        for t in T
+            push!(combined_commit, (i, t, value(COMMIT[i, t]), t < recommit_time ? "UC" : "RUC"))
+        end
+    end
+    
+    return (
+        model = UC,
+        gen = gen_actual,
+        commit = combined_commit,  # Combined commitments with source tracking
+        loadshed = loadshed,
+        curtail = curtail,
+        reserves_up = resup,
+        reserves_down = resdn,
+        charge_df = charge_df,
+        discharge_df = discharge_df,
+        soc = soc_df,
+        flows = flows,
+        total_loadshed = sum(value.(LOADSHED)),
+        total_curtailment = sum(curtail.curt),
+        total_co2 = total_co2,
+        objective = objective_value(UC),
+        recommit_time = recommit_time
+    )
+end
